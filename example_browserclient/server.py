@@ -31,8 +31,8 @@ if __name__ == '__main__':
     recorder_config = {
         'spinner': False,
         'use_microphone': False,
-        'model': 'large-v2',
-        'language': 'en',
+        'model': 'large-v3',
+        'language': '',
         'silero_sensitivity': 0.4,
         'webrtc_sensitivity': 2,
         'post_speech_silence_duration': 0.7,
@@ -40,8 +40,10 @@ if __name__ == '__main__':
         'min_gap_between_recordings': 0,
         'enable_realtime_transcription': True,
         'realtime_processing_pause': 0,
-        'realtime_model_type': 'tiny.en',
+        'realtime_model_type': 'large-v3',
         'on_realtime_transcription_stabilized': text_detected,
+        'ensure_sentence_ends_with_period': True,
+        'ensure_sentence_starting_uppercase': True,
     }
 
     def recorder_thread():
@@ -99,7 +101,7 @@ if __name__ == '__main__':
             recorder.feed_audio(resampled_chunk)
 
     # start_server = websockets.serve(echo, "0.0.0.0", 9001)
-    start_server = websockets.serve(echo, "localhost", 8001)
+    start_server = websockets.serve(echo, "0.0.0.0", 8533)
 
     recorder_thread = threading.Thread(target=recorder_thread)
     recorder_thread.start()

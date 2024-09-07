@@ -1,8 +1,11 @@
 let socket = new WebSocket("ws://localhost:8001");
 let displayDiv = document.getElementById('textDisplay');
+let translationDisplayDiv = document.getElementById('translationDisplay');
+let historyDisplayDiv = document.getElementById('historyDisplay');
 let server_available = false;
 let mic_available = false;
 let fullSentences = [];
+let fullSentencesTranslation = [];
 
 const serverCheckInterval = 5000; // Check every 5 seconds
 
@@ -18,10 +21,17 @@ function connectToServer() {
         let data = JSON.parse(event.data);
 
         if (data.type === 'realtime') {
-            displayRealtimeText(data.text, displayDiv);
+            displayRealtimeText(data.text, displayDiv, fullSentences);
+            translateText(data.text).then(translation => {
+                displayRealtimeText(translation, translationDisplayDiv, fullSentencesTranslation);
+            });
         } else if (data.type === 'fullSentence') {
             fullSentences.push(data.text);
-            displayRealtimeText("", displayDiv); // Refresh display with new full sentence
+            displayRealtimeText("", displayDiv, fullSentences); // Refresh display with new full sentence
+            translateText(data.text).then(translation => {
+                fullSentencesTranslation.push(translation);
+                displayRealtimeText("", translationDisplayDiv, fullSentencesTranslation); // Refresh display with new full sentence
+            });
         }
     };
 
@@ -34,22 +44,53 @@ socket.onmessage = function(event) {
     let data = JSON.parse(event.data);
 
     if (data.type === 'realtime') {
-        displayRealtimeText(data.text, displayDiv);
+        displayRealtimeText(data.text, displayDiv, fullSentences);
+        translateText(data.text).then(translation => {
+            displayRealtimeText(translation, translationDisplayDiv, fullSentencesTranslation);
+        });
     } else if (data.type === 'fullSentence') {
         fullSentences.push(data.text);
-        displayRealtimeText("", displayDiv); // Refresh display with new full sentence
+        displayRealtimeText("", displayDiv, fullSentences); // Refresh display with new full sentence
+        translateText(data.text).then(translation => {
+            fullSentencesTranslation.push(translation);
+            displayRealtimeText("", translationDisplayDiv, fullSentencesTranslation); // Refresh display with new full sentence
+            let mixedSentences = fullSentences.map((sentence, index) => {
+                return `<span>${sentence} (${fullSentencesTranslation[index]})</span>`;
+            });
+            historyDisplayDiv.innerHTML = mixedSentences.join('<br>');
+        });
     }
 };
 
-function displayRealtimeText(realtimeText, displayDiv) {
+function displayRealtimeText(realtimeText, displayDiv, fullSentences=[]) {
     let displayedText = fullSentences.map((sentence, index) => {
         let span = document.createElement('span');
         span.textContent = sentence + " ";
         span.className = index % 2 === 0 ? 'yellow' : 'cyan';
+        span.className += ' text-display';
         return span.outerHTML;
-    }).join('') + realtimeText;
+    }).join('<br>') + '<br>' + realtimeText;
 
-    displayDiv.innerHTML = displayedText;
+    displayDiv.innerHTML = '<div style="flex-grow: 1;"></div>' + displayedText;
+}
+
+function translateText(text) {
+    const targetLang = "zh-tw"; // 如果无法获取用户语言，则默认为繁体中文
+    const sourceLang = "auto"; // 使用请求中的原始语言或默认为自动检测
+
+    const apiUrl = `https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sourceLang}&tl=${targetLang}&hl=en-US&dt=t&dt=bd&dj=1&source=input&q=${encodeURIComponent(text)}`;
+
+    // 返回一个 Promise，确保调用时可以使用 .then()
+    return fetch(apiUrl)
+        .then(response => response.json())
+        .then(data => {
+            const translation = data.sentences.map((s) => s.trans).join(" ");
+            return translation; // 确保返回翻译结果
+        })
+        .catch(err => {
+            console.error(err);
+            return "Error: Translation";
+        });
 }
 
 function start_msg() {
@@ -59,6 +100,7 @@ function start_msg() {
         displayRealtimeText("🖥️  please start server  🖥️", displayDiv);
     else
         displayRealtimeText("👄  start speaking  👄", displayDiv);
+        displayRealtimeText("👄  start speaking  👄", translationDisplayDiv);
 };
 
 // Check server availability periodically
