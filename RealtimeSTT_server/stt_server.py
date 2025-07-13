@@ -64,7 +64,6 @@ stt-server [OPTIONS]
     - `--handle_buffer_overflow`: Handle buffer overflow during transcription.
     - `--suppress_tokens`: Suppress tokens during transcription.
     - `--allowed_latency_limit`: Allowed latency limit for real-time transcription.
-    - `--faster_whisper_vad_filter`: Enable VAD filter for Faster Whisper; default False.
 
 
 ### WebSocket Interface:
@@ -533,8 +532,6 @@ def parse_arguments():
     parser.add_argument('--allowed_latency_limit', type=int, default=100,
                         help='Maximal amount of chunks that can be unprocessed in queue before discarding chunks.. Default is 100.')
 
-    parser.add_argument('--faster_whisper_vad_filter', action='store_true',
-                        help='Enable VAD filter for Faster Whisper. Default is False.')
 
     parser.add_argument('--logchunks', action='store_true', help='Enable logging of incoming audio chunks (periods)')
 
@@ -852,7 +849,6 @@ async def main_async():
         'handle_buffer_overflow': args.handle_buffer_overflow,
         'suppress_tokens': args.suppress_tokens,
         'allowed_latency_limit': args.allowed_latency_limit,
-        'faster_whisper_vad_filter': args.faster_whisper_vad_filter,
     }
 
     try:

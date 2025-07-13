@@ -3,9 +3,9 @@
 The AudioToTextRecorder class in the provided code facilitates
 fast speech-to-text transcription.
 
-The class employs the faster_whisper library to transcribe the recorded audio
-into text using machine learning models, which can be run either on a GPU or
-CPU. Voice activity detection (VAD) is built in, meaning the software can
+The class employs the OpenAI Whisper API to transcribe the recorded audio
+into text using cloud-based models. Voice activity detection (VAD) is built in,
+meaning the software can
 automatically start or stop recording based on the presence or absence of
 speech. It integrates wake word detection through the pvporcupine library,
 allowing the software to initiate recording when a specific word or phrase
@@ -26,7 +26,6 @@ Author: Kolja Beigel
 
 """
 
-from faster_whisper import WhisperModel, BatchedInferencePipeline
 from typing import Iterable, List, Optional, Union
 from openwakeword.model import Model
 import torch.multiprocessing as mp
@@ -36,8 +35,9 @@ from ctypes import c_bool
 from scipy import signal
 from .safepipe import SafePipe
 import soundfile as sf
-import faster_whisper
 import openwakeword
+import openai
+import io
 import collections
 import numpy as np
 import pvporcupine
@@ -94,7 +94,7 @@ if platform.system() != 'Darwin':
 class TranscriptionWorker:
     def __init__(self, conn, stdout_pipe, model_path, download_root, compute_type, gpu_device_index, device,
                  ready_event, shutdown_event, interrupt_stop_event, beam_size, initial_prompt, suppress_tokens,
-                 batch_size, faster_whisper_vad_filter, normalize_audio):
+                 batch_size, use_vad_filter, normalize_audio):
         self.conn = conn
         self.stdout_pipe = stdout_pipe
         self.model_path = model_path
@@ -109,7 +109,7 @@ class TranscriptionWorker:
         self.initial_prompt = initial_prompt
         self.suppress_tokens = suppress_tokens
         self.batch_size = batch_size
-        self.faster_whisper_vad_filter = faster_whisper_vad_filter
+        self.use_vad_filter = use_vad_filter
         self.normalize_audio = normalize_audio
         self.queue = queue.Queue()
 
@@ -139,34 +139,12 @@ class TranscriptionWorker:
              system_signal.signal(system_signal.SIGINT, system_signal.SIG_IGN)
              __builtins__['print'] = self.custom_print
 
-        logging.info(f"Initializing faster_whisper main transcription model {self.model_path}")
+        logging.info("Starting OpenAI transcription worker")
 
-        try:
-            model = faster_whisper.WhisperModel(
-                model_size_or_path=self.model_path,
-                device=self.device,
-                compute_type=self.compute_type,
-                device_index=self.gpu_device_index,
-                download_root=self.download_root,
-            )
-            # Create a short dummy audio array, for example 1 second of silence at 16 kHz
-            if self.batch_size > 0:
-                model = BatchedInferencePipeline(model=model)
-
-            # Run a warm-up transcription
-            current_dir = os.path.dirname(os.path.realpath(__file__))
-            warmup_audio_path = os.path.join(
-                current_dir, "warmup_audio.wav"
-            )
-            warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-            segments, info = model.transcribe(warmup_audio_data, language="en", beam_size=1)
-            model_warmup_transcription = " ".join(segment.text for segment in segments)
-        except Exception as e:
-            logging.exception(f"Error initializing main faster_whisper transcription model: {e}")
-            raise
+        openai.api_key = "XXXX"
 
         self.ready_event.set()
-        logging.debug("Faster_whisper main speech to text transcription model initialized successfully")
+        logging.debug("OpenAI transcription worker initialized successfully")
 
         # Start the polling thread
         polling_thread = threading.Thread(target=self.poll_connection)
@@ -176,65 +154,56 @@ class TranscriptionWorker:
             while not self.shutdown_event.is_set():
                 try:
                     audio, language, use_prompt = self.queue.get(timeout=0.1)
-                    try:
-                        logging.debug(f"Transcribing audio with language {language}")
-                        start_t = time.time()
-
-                        # normalize audio to -0.95 dBFS
-                        if audio is not None and audio .size > 0:
-                            if self.normalize_audio:
-                                peak = np.max(np.abs(audio))
-                                if peak > 0:
-                                    audio = (audio / peak) * 0.95
-                        else:
-                            logging.error("Received None audio for transcription")
-                            self.conn.send(('error', "Received None audio for transcription"))
-                            continue
-
-                        prompt = None
-                        if use_prompt:
-                            prompt = self.initial_prompt if self.initial_prompt else None
-
-                        if self.batch_size > 0:
-                            segments, info = model.transcribe(
-                                audio,
-                                language=language if language else None,
-                                beam_size=self.beam_size,
-                                initial_prompt=prompt,
-                                suppress_tokens=self.suppress_tokens,
-                                batch_size=self.batch_size, 
-                                vad_filter=self.faster_whisper_vad_filter
-                            )
-                        else:
-                            segments, info = model.transcribe(
-                                audio,
-                                language=language if language else None,
-                                beam_size=self.beam_size,
-                                initial_prompt=prompt,
-                                suppress_tokens=self.suppress_tokens,
-                                vad_filter=self.faster_whisper_vad_filter
-                            )
-                        elapsed = time.time() - start_t
-                        transcription = " ".join(seg.text for seg in segments).strip()
-                        logging.debug(f"Final text detected with main model: {transcription} in {elapsed:.4f}s")
-                        self.conn.send(('success', (transcription, info)))
-                    except Exception as e:
-                        logging.error(f"General error in transcription: {e}", exc_info=True)
-                        self.conn.send(('error', str(e)))
                 except queue.Empty:
                     continue
-                except KeyboardInterrupt:
-                    self.interrupt_stop_event.set()
-                    logging.debug("Transcription worker process finished due to KeyboardInterrupt")
-                    break
+                try:
+                    logging.debug(f"Transcribing audio with language {language}")
+
+                    if audio is None or audio.size == 0:
+                        logging.error("Received None audio for transcription")
+                        self.conn.send(('error', "Received None audio for transcription"))
+                        continue
+
+                    if self.normalize_audio:
+                        peak = np.max(np.abs(audio))
+                        if peak > 0:
+                            audio = (audio / peak) * 0.95
+
+                    prompt = self.initial_prompt if use_prompt and self.initial_prompt else None
+
+                    audio_buffer = io.BytesIO()
+                    sf.write(audio_buffer, audio, SAMPLE_RATE, format='wav')
+                    audio_buffer.seek(0)
+
+                    kwargs = {}
+                    if language:
+                        kwargs['language'] = language
+                    if prompt:
+                        kwargs['prompt'] = prompt
+
+                    start_t = time.time()
+                    result = openai.Audio.transcribe('whisper-1', audio_buffer, **kwargs)
+                    elapsed = time.time() - start_t
+
+                    transcription = result.get('text', '').strip()
+
+                    Info = type('Info', (), {'language': language, 'language_probability': 0})
+                    Segment = type('Segment', (), {'text': transcription})
+
+                    logging.debug(f"Final text detected with OpenAI API: {transcription} in {elapsed:.4f}s")
+                    self.conn.send(('success', ([Segment], Info)))
                 except Exception as e:
-                    logging.error(f"General error in processing queue item: {e}", exc_info=True)
+                    logging.error(f"General error in transcription: {e}", exc_info=True)
+                    self.conn.send(('error', str(e)))
+        except KeyboardInterrupt:
+            self.interrupt_stop_event.set()
+            logging.debug("Transcription worker process finished due to KeyboardInterrupt")
         finally:
-            __builtins__['print'] = print  # Restore the original print function
+            __builtins__['print'] = print
             self.conn.close()
             self.stdout_pipe.close()
-            self.shutdown_event.set()  # Ensure the polling thread will stop
-            polling_thread.join()  # Wait for the polling thread to finish
+            self.shutdown_event.set()
+            polling_thread.join()
 
 
 class bcolors:
@@ -247,7 +216,7 @@ class AudioToTextRecorder:
     """
     A class responsible for capturing audio from the microphone, detecting
     voice activity, and then transcribing the captured audio using the
-    `faster_whisper` model.
+    OpenAI Whisper API.
     """
 
     def __init__(self,
@@ -332,7 +301,7 @@ class AudioToTextRecorder:
                  allowed_latency_limit: int = ALLOWED_LATENCY_LIMIT,
                  no_log_file: bool = False,
                  use_extended_logging: bool = False,
-                 faster_whisper_vad_filter: bool = True,
+                 use_vad_filter: bool = True,
                  normalize_audio: bool = False,
                  start_callback_in_new_thread: bool = False,
                  ):
@@ -560,10 +529,10 @@ class AudioToTextRecorder:
         - use_extended_logging (bool, default=False): Writes extensive
             log messages for the recording worker, that processes the audio
             chunks.
-        - faster_whisper_vad_filter (bool, default=True): If set to True,
-            the system will additionally use the VAD filter from the faster_whisper library
-            for voice activity detection. This filter is more robust against
-            background noise but requires additional GPU resources.
+        - use_vad_filter (bool, default=True): If set to True,
+            an additional VAD filter is used for voice activity detection,
+            which is more robust against background noise but may require
+            additional resources.
         - normalize_audio (bool, default=False): If set to True, the system will
             normalize the audio to a specific range before processing. This can
             help improve the quality of the transcription.
@@ -683,7 +652,7 @@ class AudioToTextRecorder:
         self.print_transcription_time = print_transcription_time
         self.early_transcription_on_silence = early_transcription_on_silence
         self.use_extended_logging = use_extended_logging
-        self.faster_whisper_vad_filter = faster_whisper_vad_filter
+        self.use_vad_filter = use_vad_filter
         self.normalize_audio = normalize_audio
         self.awaiting_speech_end = False
         self.start_callback_in_new_thread = start_callback_in_new_thread
@@ -756,7 +725,7 @@ class AudioToTextRecorder:
                 self.initial_prompt,
                 self.suppress_tokens,
                 self.batch_size,
-                self.faster_whisper_vad_filter,
+                self.use_vad_filter,
                 self.normalize_audio,
             )
         )
@@ -781,42 +750,7 @@ class AudioToTextRecorder:
                 )
             )
 
-        # Initialize the realtime transcription model
-        if self.enable_realtime_transcription and not self.use_main_model_for_realtime:
-            try:
-                logger.info("Initializing faster_whisper realtime "
-                             f"transcription model {self.realtime_model_type}, "
-                             f"default device: {self.device}, "
-                             f"compute type: {self.compute_type}, "
-                             f"device index: {self.gpu_device_index}, "
-                             f"download root: {self.download_root}"
-                             )
-                self.realtime_model_type = faster_whisper.WhisperModel(
-                    model_size_or_path=self.realtime_model_type,
-                    device=self.device,
-                    compute_type=self.compute_type,
-                    device_index=self.gpu_device_index,
-                    download_root=self.download_root,
-                )
-                if self.realtime_batch_size > 0:
-                    self.realtime_model_type = BatchedInferencePipeline(model=self.realtime_model_type)
-
-                # Run a warm-up transcription
-                current_dir = os.path.dirname(os.path.realpath(__file__))
-                warmup_audio_path = os.path.join(
-                    current_dir, "warmup_audio.wav"
-                )
-                warmup_audio_data, _ = sf.read(warmup_audio_path, dtype="float32")
-                segments, info = self.realtime_model_type.transcribe(warmup_audio_data, language="en", beam_size=1)
-                model_warmup_transcription = " ".join(segment.text for segment in segments)
-            except Exception as e:
-                logger.exception("Error initializing faster_whisper "
-                                  f"realtime transcription model: {e}"
-                                  )
-                raise
-
-            logger.debug("Faster_whisper realtime speech to text "
-                          "transcription model initialized successfully")
+        # Realtime transcription with OpenAI is not supported in this version
 
         # Setup wake word detection
         if wake_words or wakeword_backend in {'oww', 'openwakeword', 'openwakewords', 'pvp', 'pvporcupine'}:
@@ -958,10 +892,11 @@ class AudioToTextRecorder:
         self.recording_thread.daemon = True
         self.recording_thread.start()
 
-        # Start the realtime transcription worker thread
-        self.realtime_thread = threading.Thread(target=self._realtime_worker)
-        self.realtime_thread.daemon = True
-        self.realtime_thread.start()
+        # Start the realtime transcription worker thread (disabled for OpenAI API)
+        if self.enable_realtime_transcription:
+            self.realtime_thread = threading.Thread(target=self._realtime_worker)
+            self.realtime_thread.daemon = True
+            self.realtime_thread.start()
                    
         # Wait for transcription models to start
         logger.debug('Waiting for main transcription model to start')
@@ -1555,7 +1490,7 @@ class AudioToTextRecorder:
     def transcribe(self):
         """
         Transcribes audio captured by this class instance using the
-        `faster_whisper` model.
+        OpenAI Whisper API.
 
         Automatically starts recording upon voice activity if not manually
           started using `recorder.start()`.
@@ -1633,7 +1568,7 @@ class AudioToTextRecorder:
              ):
         """
         Transcribes audio captured by this class instance
-        using the `faster_whisper` model.
+        using the OpenAI Whisper API.
 
         - Automatically starts recording upon voice activity if not manually
           started using `recorder.start()`.
@@ -2311,194 +2246,8 @@ class AudioToTextRecorder:
 
 
     def _realtime_worker(self):
-        """
-        Performs real-time transcription if the feature is enabled.
-
-        The method is responsible transcribing recorded audio frames
-          in real-time based on the specified resolution interval.
-        The transcribed text is stored in `self.realtime_transcription_text`
-          and a callback
-        function is invoked with this text if specified.
-        """
-
-        try:
-
-            logger.debug('Starting realtime worker')
-
-            # Return immediately if real-time transcription is not enabled
-            if not self.enable_realtime_transcription:
-                return
-
-            # Track time of last transcription
-            last_transcription_time = time.time()
-
-            while self.is_running:
-
-                if self.is_recording:
-
-                    # MODIFIED SLEEP LOGIC:
-                    # Wait until realtime_processing_pause has elapsed,
-                    # but check often so we can respond to changes quickly.
-                    while (
-                        time.time() - last_transcription_time
-                    ) < self.realtime_processing_pause:
-                        time.sleep(0.001)
-                        if not self.is_running or not self.is_recording:
-                            break
-
-                    if self.awaiting_speech_end:
-                        time.sleep(0.001)
-                        continue
-
-                    # Update transcription time
-                    last_transcription_time = time.time()
-
-                    # Convert the buffer frames to a NumPy array
-                    audio_array = np.frombuffer(
-                        b''.join(self.frames),
-                        dtype=np.int16
-                        )
-
-                    logger.debug(f"Current realtime buffer size: {len(audio_array)}")
-
-                    # Normalize the array to a [-1, 1] range
-                    audio_array = audio_array.astype(np.float32) / \
-                        INT16_MAX_ABS_VALUE
-
-                    if self.use_main_model_for_realtime:
-                        with self.transcription_lock:
-                            try:
-                                self.parent_transcription_pipe.send((audio_array, self.language, True))
-                                if self.parent_transcription_pipe.poll(timeout=5):  # Wait for 5 seconds
-                                    logger.debug("Receive from realtime worker after transcription request to main model")
-                                    status, result = self.parent_transcription_pipe.recv()
-                                    if status == 'success':
-                                        segments, info = result
-                                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                                        self.detected_realtime_language_probability = info.language_probability
-                                        realtime_text = segments
-                                        logger.debug(f"Realtime text detected with main model: {realtime_text}")
-                                    else:
-                                        logger.error(f"Realtime transcription error: {result}")
-                                        continue
-                                else:
-                                    logger.warning("Realtime transcription timed out")
-                                    continue
-                            except Exception as e:
-                                logger.error(f"Error in realtime transcription: {str(e)}", exc_info=True)
-                                continue
-                    else:
-                        # Perform transcription and assemble the text
-                        if self.normalize_audio:
-                            # normalize audio to -0.95 dBFS
-                            if audio_array is not None and audio_array.size > 0:
-                                peak = np.max(np.abs(audio_array))
-                                if peak > 0:
-                                    audio_array = (audio_array / peak) * 0.95
-
-                        if self.realtime_batch_size > 0:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens,
-                                batch_size=self.realtime_batch_size,
-                                vad_filter=self.faster_whisper_vad_filter
-                            )
-                        else:
-                            segments, info = self.realtime_model_type.transcribe(
-                                audio_array,
-                                language=self.language if self.language else None,
-                                beam_size=self.beam_size_realtime,
-                                initial_prompt=self.initial_prompt_realtime,
-                                suppress_tokens=self.suppress_tokens,
-                                vad_filter=self.faster_whisper_vad_filter
-                            )
-
-                        self.detected_realtime_language = info.language if info.language_probability > 0 else None
-                        self.detected_realtime_language_probability = info.language_probability
-                        realtime_text = " ".join(
-                            seg.text for seg in segments
-                        )
-                        logger.debug(f"Realtime text detected: {realtime_text}")
-
-                    # double check recording state
-                    # because it could have changed mid-transcription
-                    if self.is_recording and time.time() - \
-                            self.recording_start_time > self.init_realtime_after_seconds:
-
-                        self.realtime_transcription_text = realtime_text
-                        self.realtime_transcription_text = \
-                            self.realtime_transcription_text.strip()
-
-                        self.text_storage.append(
-                            self.realtime_transcription_text
-                            )
-
-                        # Take the last two texts in storage, if they exist
-                        if len(self.text_storage) >= 2:
-                            last_two_texts = self.text_storage[-2:]
-
-                            # Find the longest common prefix
-                            # between the two texts
-                            prefix = os.path.commonprefix(
-                                [last_two_texts[0], last_two_texts[1]]
-                                )
-
-                            # This prefix is the text that was transcripted
-                            # two times in the same way
-                            # Store as "safely detected text"
-                            if len(prefix) >= \
-                                    len(self.realtime_stabilized_safetext):
-
-                                # Only store when longer than the previous
-                                # as additional security
-                                self.realtime_stabilized_safetext = prefix
-
-                        # Find parts of the stabilized text
-                        # in the freshly transcripted text
-                        matching_pos = self._find_tail_match_in_text(
-                            self.realtime_stabilized_safetext,
-                            self.realtime_transcription_text
-                            )
-
-                        if matching_pos < 0:
-                            # pick which text to send
-                            text_to_send = (
-                                self.realtime_stabilized_safetext
-                                if self.realtime_stabilized_safetext
-                                else self.realtime_transcription_text
-                            )
-                            # preprocess once
-                            processed = self._preprocess_output(text_to_send, True)
-                            # invoke on its own thread
-                            self._run_callback(self._on_realtime_transcription_stabilized, processed)
-
-                        else:
-                            # We found parts of the stabilized text
-                            # in the transcripted text
-                            # We now take the stabilized text
-                            # and add only the freshly transcripted part to it
-                            output_text = self.realtime_stabilized_safetext + \
-                                self.realtime_transcription_text[matching_pos:]
-
-                            # This yields us the "left" text part as stabilized
-                            # AND at the same time delivers fresh detected
-                            # parts on the first run without the need for
-                            # two transcriptions
-                            self._run_callback(self._on_realtime_transcription_stabilized, self._preprocess_output(output_text, True))
-
-                        # Invoke the callback with the transcribed text
-                        self._run_callback(self._on_realtime_transcription_update, self._preprocess_output(self.realtime_transcription_text,True))
-
-                # If not recording, sleep briefly before checking again
-                else:
-                    time.sleep(TIME_SLEEP)
-
-        except Exception as e:
-            logger.error(f"Unhandled exeption in _realtime_worker: {e}", exc_info=True)
-            raise
+        """Real-time transcription is not supported with the OpenAI backend."""
+        logger.info("Realtime transcription is not supported with the OpenAI backend")
 
     def _is_silero_speech(self, chunk):
         """

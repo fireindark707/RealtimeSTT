@@ -94,7 +94,7 @@ This library uses:
   - [WebRTCVAD](https://github.com/wiseman/py-webrtcvad) for initial voice activity detection.
   - [SileroVAD](https://github.com/snakers4/silero-vad) for more accurate verification.
 - **Speech-To-Text**
-  - [Faster_Whisper](https://github.com/guillaumekln/faster-whisper) for instant (GPU-accelerated) transcription.
+  - OpenAI Whisper API for high quality cloud-based transcription.
 - **Wake Word Detection**
   - [Porcupine](https://github.com/Picovoice/porcupine) or [OpenWakeWord](https://github.com/dscripka/openWakeWord) for wake word detection.
 
